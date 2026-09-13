@@ -28,12 +28,12 @@ use nautilus_common::python::wrappers::release_python_wrapper;
 use nautilus_common::{
     actor::{
         DataActor, DataActorNative,
-        registry::{deregister_actor, try_get_actor_unchecked},
+        registry::{actor_exists, deregister_actor, try_get_actor_unchecked},
     },
     cache::Cache,
     clock::Clock,
     component::{
-        Component, component_state, deregister_component, dispose_component,
+        Component, component_state, deregister_component, dispose_component, get_component,
         register_component_actor, release_component_subscriptions, reset_component,
         start_component, stop_component,
     },
@@ -1415,10 +1415,15 @@ impl Trader {
     ///
     /// # Errors
     ///
-    /// Returns an error if the strategy is not registered, the cache is already borrowed, or
-    /// disposal fails. A cache borrow failure preserves the strategy registration and its external
-    /// order claims. A failed disposal keeps the strategy registered and tracked, and leaves it
-    /// `Faulted`; see [`Component::dispose`]. Calling this again retires the strategy.
+    /// Returns an error if the strategy is not tracked by this trader, the cache is already
+    /// borrowed, or disposal fails. A cache borrow failure preserves the strategy registration and
+    /// its external order claims. A failed disposal keeps the strategy registered and tracked, and
+    /// leaves it `Faulted`; see [`Component::dispose`]. Calling this again retires the strategy.
+    ///
+    /// A strategy the trader still tracks whose component the global registry no longer holds is
+    /// retired rather than rejected: the component is unreachable through the component API, and
+    /// the registrations this trader installed are still owed their cleanup. Subscriptions the
+    /// component installed on its own behalf are not released by this path, which needs the object.
     pub fn remove_strategy(&mut self, strategy_id: &StrategyId) -> anyhow::Result<()> {
         if !self.strategy_ids.contains(strategy_id) {
             anyhow::bail!("Cannot remove strategy, {strategy_id} not found");
@@ -1478,7 +1483,13 @@ impl Trader {
     /// Disposes an execution algorithm, then releases everything its registration created.
     fn retire_exec_algorithm(&mut self, exec_algorithm_id: ExecAlgorithmId) -> anyhow::Result<()> {
         Self::dispose_registered_component(exec_algorithm_id.inner())?;
-        self.cleanup_exec_algorithm_subscriptions(exec_algorithm_id)?;
+        if actor_exists(&exec_algorithm_id.inner()) {
+            self.cleanup_exec_algorithm_subscriptions(exec_algorithm_id)?;
+        } else {
+            log::debug!(
+                "Execution algorithm {exec_algorithm_id} not found, skipping subscription cleanup"
+            );
+        }
 
         let endpoint: Ustr = format!("{exec_algorithm_id}.execute").into();
         msgbus::deregister_any(endpoint.into());
@@ -1496,8 +1507,19 @@ impl Trader {
     /// A component disposed from Python has already run `on_dispose`, so a second disposal
     /// transition would fail and strand the trader's bookkeeping. A `Faulted` component may have
     /// retained subscriptions after `on_dispose` failed, so release them idempotently without
-    /// invoking the failed hook again.
+    /// invoking the failed hook again. A component the registry no longer holds is unreachable
+    /// through the component API, so disposal and component subscription release are skipped and
+    /// retirement proceeds to the caller's own bookkeeping rather than stranding it.
+    ///
+    /// Presence is tested through [`get_component`] rather than inferred from a
+    /// [`component_state`] failure, because that error channel does not distinguish an absent
+    /// component from one that is already mutably borrowed, and a borrowed component is still live.
     fn dispose_registered_component(id: Ustr) -> anyhow::Result<()> {
+        if get_component(&id).is_none() {
+            log::debug!("Component {id} not found, skipping disposal transition");
+            return Ok(());
+        }
+
         let state = component_state(&id)?;
 
         if state == ComponentState::Disposed {
@@ -2068,6 +2090,8 @@ mod tests {
     struct TestStrategy {
         core: StrategyCore,
         fail_stop: bool,
+        check_reentrant_borrow_on_dispose: bool,
+        order_events: Rc<Cell<usize>>,
     }
 
     impl TestStrategy {
@@ -2075,6 +2099,8 @@ mod tests {
             Self {
                 core: StrategyCore::new(config),
                 fail_stop: false,
+                check_reentrant_borrow_on_dispose: false,
+                order_events: Rc::new(Cell::new(0)),
             }
         }
     }
@@ -2086,9 +2112,20 @@ mod tests {
             }
             Ok(())
         }
+
+        fn on_dispose(&mut self) -> anyhow::Result<()> {
+            if self.check_reentrant_borrow_on_dispose {
+                Trader::dispose_registered_component(self.actor_id().inner())?;
+            }
+            Ok(())
+        }
     }
 
-    nautilus_strategy!(TestStrategy);
+    nautilus_strategy!(TestStrategy, {
+        fn on_order_event(&mut self, _event: OrderEventAny) {
+            self.order_events.set(self.order_events.get() + 1);
+        }
+    });
 
     #[derive(Debug)]
     struct TimerRoutingStrategy {
@@ -4305,6 +4342,222 @@ class StateComponent:
     }
 
     #[rstest]
+    fn test_remove_strategy_retires_trader_state_when_component_is_missing() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache.clone(),
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("Missing-001");
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        trader
+            .add_strategy(TestStrategy::new(StrategyConfig {
+                strategy_id: Some(strategy_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .set_external_order_claims(strategy_id, &[instrument_id])
+            .unwrap();
+
+        let order_topic = get_event_order_topic(strategy_id);
+        let position_topic = get_event_position_topic(strategy_id);
+        let sibling_order_calls = Rc::new(Cell::new(0));
+        let sibling_position_calls = Rc::new(Cell::new(0));
+        let order_calls = Rc::clone(&sibling_order_calls);
+        let position_calls = Rc::clone(&sibling_position_calls);
+        let sibling_order_handler = TypedHandler::from(move |_: &OrderEventAny| {
+            order_calls.set(order_calls.get() + 1);
+        });
+        let sibling_position_handler = TypedHandler::from(move |_: &PositionEvent| {
+            position_calls.set(position_calls.get() + 1);
+        });
+        msgbus::subscribe_order_events(order_topic.into(), sibling_order_handler.clone(), None);
+        msgbus::subscribe_position_events(
+            position_topic.into(),
+            sibling_position_handler.clone(),
+            None,
+        );
+        assert!(trader.strategy_state_callbacks.contains_key(&strategy_id));
+        assert!(trader.strategy_stop_fns.contains_key(&strategy_id));
+        assert!(trader.strategy_handler_ids.contains_key(&strategy_id));
+        assert!(
+            get_message_bus()
+                .borrow_mut()
+                .endpoint_map::<StrategyCommand>()
+                .is_registered(strategy_control_endpoint(strategy_id))
+        );
+
+        deregister_component(&strategy_id.inner());
+        trader.remove_strategy(&strategy_id).unwrap();
+
+        assert!(trader.strategy_ids().is_empty());
+        assert!(get_component(&strategy_id.inner()).is_none());
+        assert!(!actor_exists(&strategy_id.inner()));
+        assert!(trader.get_component_clocks().is_empty());
+        assert_eq!(cache.borrow().external_order_claim(&instrument_id), None);
+        assert!(
+            !get_message_bus()
+                .borrow_mut()
+                .endpoint_map::<StrategyCommand>()
+                .is_registered(strategy_control_endpoint(strategy_id))
+        );
+        assert!(!trader.strategy_state_callbacks.contains_key(&strategy_id));
+        assert!(!trader.strategy_stop_fns.contains_key(&strategy_id));
+        assert!(!trader.strategy_handler_ids.contains_key(&strategy_id));
+
+        let order = OrderRejectedSpec::builder()
+            .trader_id(TraderId::test_default())
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-MISSING-001"))
+            .reason("TEST".into())
+            .build();
+        let position = PositionEvent::PositionAdjusted(PositionAdjusted::new(
+            TraderId::test_default(),
+            strategy_id,
+            instrument_id,
+            PositionId::from("P-MISSING-001"),
+            AccountId::test_default(),
+            PositionAdjustmentType::Funding,
+            None,
+            None,
+            None,
+            UUID4::new(),
+            0.into(),
+            0.into(),
+        ));
+        msgbus::publish_order_event(order_topic, &OrderEventAny::Rejected(order));
+        msgbus::publish_position_event(position_topic, &position);
+        assert_eq!(sibling_order_calls.get(), 1);
+        assert_eq!(sibling_position_calls.get(), 1);
+
+        let redeployed = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            ..Default::default()
+        });
+        let redeployed_order_events = Rc::clone(&redeployed.order_events);
+        trader.add_strategy(redeployed).unwrap();
+        assert_eq!(trader.strategy_ids(), vec![strategy_id]);
+
+        // Dispatch is gated on the running state, so the redeployed strategy must be started
+        // before a delivery is observable
+        start_component(&strategy_id.inner()).unwrap();
+
+        // A retired handler that was never unsubscribed still resolves the id, so it would deliver
+        // to the redeployed strategy a second time
+        let redeployed_order = OrderRejectedSpec::builder()
+            .trader_id(TraderId::test_default())
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-MISSING-002"))
+            .reason("TEST".into())
+            .build();
+        msgbus::publish_order_event(order_topic, &OrderEventAny::Rejected(redeployed_order));
+        assert_eq!(
+            redeployed_order_events.get(),
+            1,
+            "the retired strategy's order handler must not survive its retirement",
+        );
+
+        msgbus::unsubscribe_order_events(order_topic.into(), &sibling_order_handler);
+        msgbus::unsubscribe_position_events(position_topic.into(), &sibling_position_handler);
+        trader.remove_strategy(&strategy_id).unwrap();
+    }
+
+    #[rstest]
+    fn test_remove_strategy_preserves_bookkeeping_when_component_is_borrowed() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache.clone(),
+            portfolio,
+        );
+        let strategy_id = StrategyId::from("Borrowed-001");
+        let instrument_id = InstrumentId::from("AUDUSD.SIM");
+        let mut strategy = TestStrategy::new(StrategyConfig {
+            strategy_id: Some(strategy_id),
+            ..Default::default()
+        });
+        strategy.check_reentrant_borrow_on_dispose = true;
+        trader.add_strategy(strategy).unwrap();
+        cache
+            .borrow_mut()
+            .set_external_order_claims(strategy_id, &[instrument_id])
+            .unwrap();
+        let error = trader.remove_strategy(&strategy_id).unwrap_err();
+
+        assert!(error.to_string().contains("already mutably borrowed"));
+        assert_eq!(trader.strategy_ids(), vec![strategy_id]);
+        assert!(get_component(&strategy_id.inner()).is_some());
+        assert!(actor_exists(&strategy_id.inner()));
+        assert_eq!(trader.get_component_clocks().len(), 1);
+        assert_eq!(
+            cache.borrow().external_order_claim(&instrument_id),
+            Some(strategy_id)
+        );
+        assert!(trader.strategy_state_callbacks.contains_key(&strategy_id));
+        assert!(trader.strategy_stop_fns.contains_key(&strategy_id));
+        assert!(trader.strategy_handler_ids.contains_key(&strategy_id));
+        assert!(
+            get_message_bus()
+                .borrow_mut()
+                .endpoint_map::<StrategyCommand>()
+                .is_registered(strategy_control_endpoint(strategy_id))
+        );
+        assert_eq!(
+            component_state(&strategy_id.inner()).unwrap(),
+            ComponentState::Faulted,
+            "a disposal that failed on the borrow error must leave the strategy Faulted",
+        );
+
+        // Retires through the existing `Faulted` route, which does not invoke the failed hook again
+        trader.remove_strategy(&strategy_id).unwrap();
+        assert!(trader.strategy_ids().is_empty());
+    }
+
+    #[rstest]
+    fn test_remove_actor_retires_trader_state_when_component_is_missing() {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache,
+            portfolio,
+        );
+        let actor_id = ActorId::from("Missing-Actor");
+        trader
+            .add_actor(TestDataActor::new(DataActorConfig {
+                actor_id: Some(actor_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        assert!(trader.actor_state_callbacks.contains_key(&actor_id));
+
+        deregister_component(&actor_id.inner());
+        trader.remove_actor(&actor_id).unwrap();
+
+        assert!(trader.actor_ids().is_empty());
+        assert!(get_component(&actor_id.inner()).is_none());
+        assert!(!actor_exists(&actor_id.inner()));
+        assert!(trader.get_component_clocks().is_empty());
+        assert!(!trader.actor_state_callbacks.contains_key(&actor_id));
+    }
+
+    #[rstest]
     fn test_remove_actor_disposes_after_stop_hook_failure() {
         let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
             create_trader_components();
@@ -4416,6 +4669,112 @@ class StateComponent:
         }
         assert!(trader.exec_algorithm_ids().is_empty());
         assert!(trader.get_component_clocks().is_empty());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_clear_exec_algorithm_retires_trader_state_when_component_is_missing(
+        #[case] remove_actor_entry: bool,
+    ) {
+        let (_msgbus, cache, portfolio, _data_engine, _risk_engine, _exec_engine, clock_factory) =
+            create_trader_components();
+        let mut trader = Trader::new(
+            TraderId::test_default(),
+            UUID4::new(),
+            Environment::Backtest,
+            clock_factory,
+            cache.clone(),
+            portfolio,
+        );
+        let exec_algorithm_id = ExecAlgorithmId::from("Missing-Exec-Algorithm");
+        trader
+            .add_exec_algorithm(TestExecutionAlgorithm::new(ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(exec_algorithm_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        let endpoint = format!("{exec_algorithm_id}.execute");
+        assert!(msgbus::has_endpoint(&endpoint));
+        assert!(
+            trader
+                .exec_algorithm_restore_fns
+                .contains_key(&exec_algorithm_id)
+        );
+        assert!(
+            trader
+                .exec_algorithm_cleanup_fns
+                .contains_key(&exec_algorithm_id)
+        );
+
+        // Algorithm-owned subscriptions, which only the algorithm object itself can release
+        let subscribed_strategy = StrategyId::from("Exec-Algo-Subscriber");
+        let client_order_id = ClientOrderId::from("O-EXEC-ALGO-001");
+        add_cached_exec_order(
+            &cache,
+            client_order_id,
+            subscribed_strategy,
+            Some(exec_algorithm_id),
+            false,
+        );
+        {
+            let mut algo =
+                try_get_actor_unchecked::<TestExecutionAlgorithm>(&exec_algorithm_id.inner())
+                    .expect("execution algorithm must be registered");
+            algo.subscribe_to_strategy_events(subscribed_strategy);
+        }
+
+        deregister_component(&exec_algorithm_id.inner());
+        if remove_actor_entry {
+            deregister_actor(&exec_algorithm_id.inner());
+        }
+        trader.clear_exec_algorithms().unwrap();
+
+        assert!(trader.exec_algorithm_ids().is_empty());
+        assert!(get_component(&exec_algorithm_id.inner()).is_none());
+        assert!(!actor_exists(&exec_algorithm_id.inner()));
+        assert!(trader.get_component_clocks().is_empty());
+        assert!(!msgbus::has_endpoint(&endpoint));
+        assert!(trader.exec_algorithm_restore_fns.is_empty());
+        assert!(trader.exec_algorithm_cleanup_fns.is_empty());
+
+        // Redeploying under the same id exposes whether the algorithm's own order handler was
+        // unsubscribed: a surviving handler resolves the id and delivers to the new instance
+        trader
+            .add_exec_algorithm(TestExecutionAlgorithm::new(ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(exec_algorithm_id),
+                ..Default::default()
+            }))
+            .unwrap();
+        start_component(&exec_algorithm_id.inner()).unwrap();
+        let rejected = OrderRejectedSpec::builder()
+            .trader_id(TraderId::test_default())
+            .strategy_id(subscribed_strategy)
+            .instrument_id(InstrumentId::test_default())
+            .client_order_id(client_order_id)
+            .reason("TEST".into())
+            .build();
+        msgbus::publish_order_event(
+            get_event_order_topic(subscribed_strategy),
+            &OrderEventAny::Rejected(rejected),
+        );
+
+        // Releasing them needs the object, so only the actor-present case can do it. The
+        // actor-absent case leaves a handler this path cannot reach, which is a limitation rather
+        // than a guarantee, so it is deliberately not asserted here.
+        if !remove_actor_entry {
+            let algo =
+                try_get_actor_unchecked::<TestExecutionAlgorithm>(&exec_algorithm_id.inner())
+                    .expect("redeployed execution algorithm must be registered");
+            assert_eq!(
+                algo.rejected_events, 0,
+                "a retired algorithm's order handler must not deliver to its replacement",
+            );
+        }
+
+        // `clear_exec_algorithms` disposes without stopping, unlike `remove_strategy`
+        stop_component(&exec_algorithm_id.inner()).unwrap();
+        trader.clear_exec_algorithms().unwrap();
     }
 
     #[rstest]
